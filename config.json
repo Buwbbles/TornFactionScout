@@ -11,18 +11,31 @@
     "_comment": "Used for the personal Fit score. Fill in or leave at 0 to disable."
   },
   "discovery": {
-    "hof_pages": 10,
-    "_comment_hof": "Each page = 100 factions from the respect hall of fame.",
-    "war_history_days": 240,
+    "hof_pages": 30,
+    "_comment_hof": "Each page = 100 factions, fetched for 3 categories. 30 pages costs ~90 calls and finds most active factions.",
+    "war_history_days": 400,
     "id_sweep": {
       "enabled": false,
       "start": 1,
-      "end": 60000,
+      "end": null,
+      "_comment_end": "null auto-detects from the highest faction ID actually seen.",
       "_comment": "Brute-force every faction ID. Thorough but slow: ~18 hours at 55/min."
     }
   },
   "enrich": {
     "refresh_after_hours": 20,
-    "max_per_run": 100000
+    "max_per_run": 100000,
+    "live_within_days": 7,
+    "quiet_within_days": 90,
+    "dead_after_days": 365,
+    "_comment_tiers": "A faction is tiered by the last thing anyone in it did. Anything past dead_after_days is kept in the database but left out of the published rankings.",
+    "refresh_days_by_tier": {
+      "live": 0,
+      "quiet": 7,
+      "dormant": 30,
+      "abandoned": 90
+    },
+    "stats_faction_limit": 1500,
+    "_comment_stats": "Only look up battle-stat estimates for the top N factions by respect. This is the slowest step; lower it to finish sooner."
   }
 }

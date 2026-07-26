@@ -50,9 +50,12 @@ of your own don't help. The default is 55/min, leaving headroom to keep playing.
 | Roster + basic for ~2,000 factions | ~2,000 | ~36 min |
 | Full ID sweep, 1–60,000 (optional) | 60,000 | ~18 hours, resumable |
 
-Start without the sweep. Hall of fame plus ranked-war history already covers essentially every
-faction worth joining — a faction that has never warred and isn't in the top few thousand by
-respect is not on your shortlist anyway.
+Start without the sweep. Hall of fame plus ranked-war history finds roughly 5,000–7,000
+factions, which covers essentially everything worth joining — a faction that has never warred
+and isn't in the top few thousand by respect is not on your shortlist anyway.
+
+If you do want literally all of them, `python3 scout.py sweep` walks every ID. It's resumable,
+so run it in whatever chunks suit you and stop with Ctrl-C any time.
 
 ---
 
@@ -73,9 +76,32 @@ respect is not on your shortlist anyway.
 | `history-save` | write `history.json` — the growth timeline, portable and tiny |
 | `history-load` | merge `history.json` back in, so the database can be rebuilt anywhere |
 | `status` | what's in the database |
+| `doctor` | test every endpoint and report what's actually working |
+| `sweep` | walk every faction ID in existence — the only complete list |
+| `territory` | one call: who holds what, and the daily respect it pays |
+| `factiontree` | cache Torn's upgrade tree so chain costs aren't guesswork |
 
 Options: `--out DIR` sends `factions.json` and `factions.csv` somewhere else, `--slim` drops
 rarely-read fields to shrink the payload, `--history FILE` points at a different history file.
+
+---
+
+## Which factions make the cut
+
+Every faction gets a tier from the last thing anyone in it did — the newest `last_action`
+across its roster, or its most recent war. This is available the first time the faction is
+seen, unlike respect growth or member churn which both need two crawls.
+
+| Tier | Meaning | Re-read every |
+|---|---|---|
+| live | someone active in the last 7 days | run |
+| quiet | nothing for a week | 7 days |
+| dormant | nothing for three months | 30 days |
+| abandoned | nothing for a year | 90 days, and **left out of the rankings** |
+
+That last row is what makes a full directory practical. Without it, a sweep that finds
+20,000 factions turns every weekly run into a four-hour job re-confirming that dead
+factions are still dead.
 
 ---
 

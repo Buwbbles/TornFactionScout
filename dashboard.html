@@ -131,6 +131,30 @@ tbody tr.open{background:var(--panel-2)}
 code{background:var(--panel);padding:2px 6px;border-radius:2px;color:var(--brass);font-size:12px}
 .hidden{display:none!important}
 .count{color:var(--dim);font-size:11px;margin-bottom:9px}
+/* ---------- banners & tags ---------- */
+.banner{
+  padding:9px 22px;font-size:11.5px;border-bottom:1px solid var(--rule);
+  background:#241d16;color:var(--brass);
+}
+.banner b{color:var(--bone)}
+.tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:3px}
+.tag{
+  font-size:9px;letter-spacing:.09em;text-transform:uppercase;padding:1px 5px;
+  border:1px solid var(--rule);border-radius:2px;color:var(--dim);font-family:var(--disp);
+}
+.tag.warring{border-color:#5c2f2b;color:#d2685c}
+.tag.chaining{border-color:#4a3a5c;color:#a887bd}
+.tag.territory{border-color:#2f4a5c;color:#79a6cb}
+.tag[data-t="crime & cash"]{border-color:#4a4326;color:#c7ab5e}
+.tag[data-t="very active"]{border-color:#2c4a37;color:#79b892}
+.caveat{
+  color:var(--dimmer);font-size:10.5px;line-height:1.5;margin-top:5px;
+  padding-left:8px;border-left:1px solid var(--rule);
+}
+.tierdot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px}
+.tier-live{background:var(--moss)} .tier-quiet{background:var(--brass)}
+.tier-dormant{background:var(--dimmer)}
+
 /* ---------- help popovers ---------- */
 .q{
   display:inline-flex;align-items:center;justify-content:center;width:13px;height:13px;
@@ -189,6 +213,12 @@ tr.hit{outline:1px solid var(--brass);outline-offset:-1px}
   <div class="eyebrow" id="subtitle">ranking every faction the api will show us</div>
   <div class="meta" id="meta"></div>
 </header>
+
+<div id="demobanner" class="banner hidden">
+  <b>This is made-up data.</b> These 140 factions do not exist — they're synthetic, for
+  checking the interface works. Run <code>python3 scout.py run</code> with a real API key to
+  replace them.
+</div>
 
 <div id="loader" class="loader">
   <h2 style="font-size:20px;letter-spacing:.1em;text-transform:uppercase">Load a dataset</h2>
@@ -269,12 +299,33 @@ tr.hit{outline:1px solid var(--brass);outline-offset:-1px}
     <label class="chk"><input type="checkbox" id="f-enlisted"> Enlisted for ranked war</label>
     <label class="chk"><input type="checkbox" id="f-warred"> Warred in the last 90 days</label>
     <label class="chk"><input type="checkbox" id="f-alive" checked> Under 25% inactive members</label>
+    <div class="fgroup" style="margin-top:10px">
+      <label for="f-tier">Last activity</label>
+      <select id="f-tier">
+        <option value="">Any</option>
+        <option value="live">Someone active this week</option>
+        <option value="quiet">Within three months</option>
+      </select>
+    </div>
+    <div class="fgroup">
+      <label for="f-style">Playstyle</label>
+      <select id="f-style">
+        <option value="">Any</option>
+        <option value="warring">Warring</option>
+        <option value="occasional war">Occasional war</option>
+        <option value="chaining">Chaining</option>
+        <option value="territory">Holds territory</option>
+        <option value="crime &amp; cash">Crime &amp; cash</option>
+        <option value="very active">Very active</option>
+      </select>
+    </div>
     <div class="fgroup"><label for="f-minwars">Minimum wars fought (all time)</label><input type="number" id="f-minwars" value="0" min="0"></div>
     <div class="fgroup"><label for="f-minlvl">Roster median level at least</label><input type="number" id="f-minlvl" value="0" min="0" max="100"></div>
     <div class="fgroup"><label for="f-minstat">Roster median stats at least (billions)</label><input type="number" id="f-minstat" value="0" min="0" step="0.1"></div>
     <div class="fgroup"><label for="f-minmem">Roster size at least</label><input type="number" id="f-minmem" value="0" min="0"></div>
 
     <div class="divider"></div>
+    <button class="btn wide" id="share">Copy a link to this view</button>
     <button class="btn wide" id="export">Export this view as CSV</button>
     <button class="btn wide" id="reload">Load a different file</button>
     <div class="eyebrow" id="coverage" style="margin-top:14px;line-height:1.9"></div>
@@ -292,6 +343,7 @@ tr.hit{outline:1px solid var(--brass);outline-offset:-1px}
       Scores are percentile ranks inside the filtered set, so they shift as you filter. Win rates
       under five wars are pulled toward 50% — a 2&ndash;0 record is not a 100% faction.
     </p>
+    <p class="eyebrow" id="recruitnote" style="margin-top:8px;line-height:1.8;color:var(--dimmer)"></p>
 
     <footer class="foot">
       <div>
@@ -425,6 +477,10 @@ const store = (() => {
 
 const tornUrl = id => 'https://www.torn.com/factions.php?step=profile&ID=' + id;
 
+/* Caveats ship with the data so they can never drift out of sync with what
+   produced it, and so none of them are only visible to someone reading source. */
+const NOTE = k => (DATA && DATA.notes && DATA.notes[k]) || '';
+
 /* Parse "1.5b", "800m", "1500000000" into a number. */
 function parseStats(txt){
   if(!txt) return 0;
@@ -554,19 +610,27 @@ const COLS = [
   {key:"name",   label:"Faction",  cls:"l", render:r =>
      `<a class="go" href="${tornUrl(r.id)}" target="_blank" rel="noopener"
          title="Open ${esc(r.name||'this faction')} in Torn" aria-label="Open in Torn">&#8599;</a>
-      <span class="fname">${esc(r.name||'?')}</span>${r.tag?` <span class="ftag">[${esc(r.tag)}]</span>`:''}`},
+      <span class="tierdot tier-${r.tier||'live'}" title="${
+        r.tier==='live'?'Someone was active this week':
+        r.tier==='quiet'?'Nothing in the last week':'Nothing in the last three months'}"></span>
+      <span class="fname">${esc(r.name||'?')}</span>${r.tag?` <span class="ftag">[${esc(r.tag)}]</span>`:''}
+      ${(r.playstyle||[]).length?`<div class="tags">${r.playstyle.map(t=>
+        `<span class="tag ${t}" data-t="${t}">${t}</span>`).join('')}</div>`:''}`},
   {key:"score",  label:"Score",    cls:"l scorecell", render:r => scoreBar(r)},
   {key:"winrate_90d", label:"Win rate 90d", render:fmtWr},
   {key:"wars_per_month", label:"Wars/mo", render:r=>r.wars_per_month?r.wars_per_month.toFixed(1):'<span class="na">—</span>'},
   {key:"days_since_war", label:"Last war", render:r=>fmtDays(r.days_since_war)},
   {key:"respect", label:"Respect", render:r=>fmtBig(r.respect)},
   {key:"respect_gain_30d", label:"Respect/30d", render:r=>r.respect_gain_30d==null?'<span class="na">—</span>':fmtBig(r.respect_gain_30d)},
-  {key:"stats_median", label:"Median stats", render:r=>fmtBig(r.stats_median)},
+  {key:"stats_median", label:"Median stats", render:r=>
+     r.stats_median!=null ? fmtBig(r.stats_median)
+     : `<span class="na" title="${r.stats_looked_up?'No estimates exist for this roster yet':'Not checked — only the top factions by respect are looked up'}">${r.stats_looked_up?'—':'not checked'}</span>`},
   {key:"stats_p10", label:"Bottom 10%", render:r=>fmtBig(r.stats_p10)},
   {key:"pct_active_7d", label:"Active 7d", render:r=>fmtPct(r.pct_active_7d)},
   {key:"level_median", label:"Med. level", render:r=>fmtInt(r.level_median)},
   {key:"members", label:"Roster", render:r=>`${r.members}<span class="na">/${r.capacity||'?'}</span>`},
   {key:"open_slots", label:"Slots", render:r=>r.open_slots?`<span class="good">${r.open_slots}</span>`:'<span class="na">0</span>'},
+  {key:"territories", label:"Territory", render:r=>r.territories?`${r.territories}<span class="na"> · ${r.territory_respect_daily}/d</span>`:'<span class="na">—</span>'},
 ];
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -588,6 +652,8 @@ function applyFilters(){
   const minLvl = +document.getElementById('f-minlvl').value || 0;
   const minStat = (+document.getElementById('f-minstat').value || 0) * 1e9;
   const minMem = +document.getElementById('f-minmem').value || 0;
+  const tier = document.getElementById('f-tier').value;
+  const style = document.getElementById('f-style').value;
 
   ROWS = DATA.factions.filter(r => {
     if(q && !((r.name||'').toLowerCase().includes(q) ||
@@ -601,6 +667,9 @@ function applyFilters(){
     if(minLvl && (r.level_median||0) < minLvl) return false;
     if(minStat && (r.stats_median||0) < minStat) return false;
     if(minMem && (r.members||0) < minMem) return false;
+    if(tier === 'live' && r.tier !== 'live') return false;
+    if(tier === 'quiet' && !['live','quiet'].includes(r.tier)) return false;
+    if(style && !(r.playstyle||[]).includes(style)) return false;
     return true;
   });
 
@@ -635,6 +704,7 @@ function render(){
 
   document.getElementById('count').textContent =
     `${ROWS.length} factions match${ROWS.length>400?' — showing the top 400':''}`;
+  if(DATA) writeUrl();
 }
 
 function detailRow(r){
@@ -665,6 +735,7 @@ function detailRow(r){
       ${L('Median tenure', r.tenure_median==null?'—':Math.round(r.tenure_median)+'d')}
       ${L('Joined in last 30d', fmtPct(r.pct_joined_30d))}</div>
     <div class="dsec"><h3>Estimated stats</h3>
+      ${r.stats_looked_up===false?'<div class="caveat">Not looked up. '+NOTE('stats_coverage')+'</div>':''}
       ${L('Coverage', fmtPct(r.stat_coverage))}
       ${L('Roster total', fmtBig(r.stats_total))}
       ${L('Median', fmtBig(r.stats_median))}
@@ -674,22 +745,25 @@ function detailRow(r){
       ${L('Strongest', fmtBig(r.stats_max))}
       ${L('Members over 1b', r.wall_1b??'—')}
       ${L('Members over 10b', r.wall_10b??'—')}
+      <div class="caveat">${NOTE('stats')}</div>
       ${ME.stats && r.stats_q ? L('You would outrank', fmtPct(fitPercentile(ME.stats, r.stats_q))) : ''}</div>
     <div class="dsec"><h3>Standing</h3>
       ${L('Respect', fmtInt(r.respect))}
       ${L('Respect / day', r.respect_gain_per_day==null?'—':fmtInt(r.respect_gain_per_day))}
       ${L('Growth window', r.growth_window_days?r.growth_window_days+'d':'—')}
+      ${r.respect_gain_per_day==null?`<div class="caveat">${NOTE('growth')}</div>`:''}
       ${L('Rank', (r.rank_name||'?')+' '+(r.rank_level||''))}
       ${L('Best chain', fmtInt(r.best_chain))}
       ${L('Chain tier unlocked', fmtInt(r.chain_tier))}
       ${L('Min respect invested', fmtInt(r.respect_invested_min))}
+      ${L('Territories', r.territories ? `${r.territories} · ${r.territory_respect_daily} respect/day` : '0')}
       ${L('Faction age', (r.age_days||0)+'d')}
-      ${L('Faction ID', r.id)}</div>
+      ${L('Faction ID', r.id)}
+      ${L('Last activity', r.days_since_activity==null?'—':r.days_since_activity+'d ago')}
+      <div class="caveat">${NOTE('respect_invested_min')}</div></div>
     <div class="dnote">
       <a href="${r.torn_url || tornUrl(r.id)}" target="_blank" rel="noopener">Open ${esc(r.name||'faction')} in Torn ↗</a>
-      &nbsp;·&nbsp; Perks are not exposed by the API for factions you are not in; "min respect invested"
-      is a floor derived from their chain tier and capacity.
-      ${r.stat_coverage==null?' Stat estimates unavailable for this roster.':''}
+      &nbsp;·&nbsp; ${NOTE('recruit')}
     </div>
   </div></td></tr>`;
 }
@@ -736,23 +810,37 @@ function boot(payload){
   const c = DATA.coverage || {};
   document.getElementById('meta').innerHTML =
     `<b>${DATA.faction_count.toLocaleString()}</b> factions &nbsp;·&nbsp; collected ${DATA.generated_human}`;
+  const t = c.by_tier || {};
   document.getElementById('coverage').innerHTML =
     `Data on hand<br>rosters ${c.with_roster||0}<br>war records ${c.with_war_record||0}<br>` +
-    `stat estimates ${c.with_stat_estimates||0}<br>growth history ${c.with_growth||0}`;
+    `stat estimates ${c.with_stat_estimates||0}<br>growth history ${c.with_growth||0}<br>` +
+    `holding territory ${c.with_territory||0}` +
+    (t.live!=null?`<br><br>active this week ${t.live}<br>within 3 months ${t.quiet}<br>` +
+      `older ${t.dormant}`:'') +
+    (DATA.excluded_inactive?`<br><br>${DATA.excluded_inactive} inactive factions left out`:'');
   if(DATA.you && DATA.you.battle_stats_total) {
     COMPONENTS.find(x=>x.key==='fit').w = 10;
     WEIGHTS.fit = 10;
   }
+  if(DATA.demo) document.getElementById('demobanner').classList.remove('hidden');
   const stamp = document.getElementById('footstamp');
   if(stamp) stamp.textContent = 'Data collected ' + DATA.generated_human + '.';
+  const rn = document.getElementById('recruitnote');
+  if(rn) rn.textContent = NOTE('recruit');
   buildConsole();
   loadMe();
+  readUrl();
+  COMPONENTS.forEach(c => {
+    const el = document.querySelector(`#weights input[data-k=${c.key}]`);
+    if(el){ el.value = WEIGHTS[c.key];
+            document.getElementById('v-' + c.key).textContent = WEIGHTS[c.key]; }
+  });
   applyFilters();
 }
 
 ['q','f-minwars','f-minlvl','f-minstat','f-minmem'].forEach(id =>
   document.getElementById(id).addEventListener('input', applyFilters));
-['f-slots','f-enlisted','f-warred','f-alive'].forEach(id =>
+['f-slots','f-enlisted','f-warred','f-alive','f-tier','f-style'].forEach(id =>
   document.getElementById(id).addEventListener('change', applyFilters));
 
 document.getElementById('head').addEventListener('click', e => {
@@ -935,6 +1023,7 @@ function jumpToFaction(){
   document.getElementById('q').value = '';
   ['f-slots','f-enlisted','f-warred','f-alive'].forEach(id =>
     document.getElementById(id).checked = false);
+  ['f-tier','f-style'].forEach(id => document.getElementById(id).value = '');
   ['f-minwars','f-minlvl','f-minstat','f-minmem'].forEach(id =>
     document.getElementById(id).value = 0);
   OPEN = hit.id;
@@ -951,6 +1040,50 @@ function jumpToFaction(){
 }
 
 const fmtBigPlain = v => fmtBig(v).replace(/<[^>]+>/g, '');
+
+/* ---------- shareable state ---------- */
+const FILTER_IDS = ['q','f-slots','f-enlisted','f-warred','f-alive','f-tier','f-style',
+                    'f-minwars','f-minlvl','f-minstat','f-minmem'];
+
+function writeUrl(){
+  const p = new URLSearchParams();
+  COMPONENTS.forEach(c => { if(WEIGHTS[c.key] !== c.w) p.set('w_' + c.key, WEIGHTS[c.key]); });
+  FILTER_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if(!el) return;
+    const def = el.type === 'checkbox' ? (id === 'f-slots' || id === 'f-alive') : '';
+    const val = el.type === 'checkbox' ? el.checked : el.value;
+    if(String(val) !== String(def) && val !== '0') p.set(id, el.type === 'checkbox' ? (val?1:0) : val);
+  });
+  if(SORT.key !== 'score') p.set('sort', SORT.key);
+  const q = p.toString();
+  history.replaceState(null, '', q ? '?' + q : location.pathname);
+}
+
+function readUrl(){
+  const p = new URLSearchParams(location.search);
+  if(![...p.keys()].length) return;
+  COMPONENTS.forEach(c => {
+    if(p.has('w_' + c.key)) WEIGHTS[c.key] = +p.get('w_' + c.key);
+  });
+  FILTER_IDS.forEach(id => {
+    if(!p.has(id)) return;
+    const el = document.getElementById(id);
+    if(!el) return;
+    if(el.type === 'checkbox') el.checked = p.get(id) === '1';
+    else el.value = p.get(id);
+  });
+  if(p.has('sort')) SORT = {key: p.get('sort'), dir: -1};
+}
+
+document.getElementById('share').onclick = () => {
+  writeUrl();
+  const btn = document.getElementById('share');
+  navigator.clipboard?.writeText(location.href).then(
+    () => { btn.textContent = 'Link copied'; setTimeout(() => btn.textContent = 'Copy a link to this view', 1800); },
+    () => { btn.textContent = 'Copy from the address bar'; }
+  );
+};
 
 /* loading */
 const drop = document.getElementById('drop'), fileEl = document.getElementById('file');

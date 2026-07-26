@@ -47,6 +47,7 @@ DB_PATH = os.path.join(HERE, "scout.db")
 CONFIG_PATH = os.path.join(HERE, "config.json")
 USER_AGENT = "TornFactionScout/1.0 (personal faction research tool)"
 OPTS = {}
+CFG = {"enrich": {}}
 
 DEFAULT_CONFIG = {
     "torn_api_key": "",
@@ -63,17 +64,23 @@ DEFAULT_CONFIG = {
     "discovery": {
         "hof_pages": 30,
         "_comment_hof": "Each page = 100 factions, fetched for 3 categories. 30 pages costs ~90 calls and finds most active factions.",
-        "war_history_days": 240,
+        "war_history_days": 400,
         "id_sweep": {
             "enabled": False,
             "start": 1,
-            "end": 60000,
+            "end": None,
+            "_comment_end": "null auto-detects from the highest faction ID actually seen.",
             "_comment": "Brute-force every faction ID. Thorough but slow: ~18 hours at 55/min."
         }
     },
     "enrich": {
         "refresh_after_hours": 20,
         "max_per_run": 100000,
+        "live_within_days": 7,
+        "quiet_within_days": 90,
+        "dead_after_days": 365,
+        "_comment_tiers": "A faction is tiered by the last thing anyone in it did. Anything past dead_after_days is kept in the database but left out of the published rankings.",
+        "refresh_days_by_tier": {"live": 0, "quiet": 7, "dormant": 30, "abandoned": 90},
         "stats_faction_limit": 1500,
         "_comment_stats": "Only look up battle-stat estimates for the top N factions by respect. This is the slowest step; lower it to finish sooner."
     }
@@ -106,9 +113,9 @@ class TornClient:
         self.calls = 0
 
     def _get(self, url):
-        self.limiter.wait()
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         for attempt in range(4):
+            self.limiter.wait()   # every attempt counts against the limit
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     self.calls += 1
@@ -122,6 +129,9 @@ class TornClient:
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
                 time.sleep(2 ** attempt * 3)
         raise RuntimeError("gave up on %s" % url.split("?")[0])
+
+    # Torn error 6 = incorrect ID. Anything else is transient or our fault.
+    ERR_NO_SUCH_ID = 6
 
     def call(self, path, version=1, **params):
         """Returns (data, error_dict_or_None). Torn returns 200 with an error body."""
@@ -164,7 +174,8 @@ def open_db():
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS faction (
         id INTEGER PRIMARY KEY, name TEXT, tag TEXT,
-        first_seen INTEGER, source TEXT, last_enriched INTEGER, dead INTEGER DEFAULT 0
+        first_seen INTEGER, source TEXT, last_enriched INTEGER, dead INTEGER DEFAULT 0,
+        tier TEXT, last_activity INTEGER
     );
     CREATE TABLE IF NOT EXISTS snapshot (
         faction_id INTEGER, ts INTEGER, respect INTEGER, member_count INTEGER,
@@ -189,10 +200,14 @@ def open_db():
         war_id INTEGER, faction_id INTEGER, name TEXT, score INTEGER, chain INTEGER,
         PRIMARY KEY (war_id, faction_id)
     );
+    CREATE TABLE IF NOT EXISTS territory (
+        name TEXT PRIMARY KEY, faction_id INTEGER, size INTEGER, daily_respect INTEGER
+    );
     CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
     CREATE INDEX IF NOT EXISTS idx_snap_f ON snapshot(faction_id, ts);
     CREATE INDEX IF NOT EXISTS idx_mem_f ON member(faction_id, ts);
     CREATE INDEX IF NOT EXISTS idx_side_f ON war_side(faction_id);
+    CREATE INDEX IF NOT EXISTS idx_terr_f ON territory(faction_id);
     """)
     conn.commit()
     return conn
@@ -288,6 +303,7 @@ def _unwrap_hof(data):
 
 
 def _id_sweep(conn, client, start, end):
+    global CFG
     cursor = int(kv_get(conn, "sweep_cursor", start))
     hits, t0, span = 0, time.time(), max(1, end - cursor)
     for fid in range(cursor, end + 1):
@@ -295,6 +311,7 @@ def _id_sweep(conn, client, start, end):
         if not err and isinstance(data, dict) and data.get("name"):
             note_faction(conn, fid, data.get("name"), data.get("tag"), "sweep")
             _store_basic(conn, fid, data)
+            _classify(conn, fid, CFG)
             hits += 1
         if fid % 200 == 0:
             kv_set(conn, "sweep_cursor", fid)
@@ -308,12 +325,29 @@ def _id_sweep(conn, client, start, end):
 # ranked wars
 # --------------------------------------------------------------------------
 
+def _detect_ceiling(conn):
+    """The highest faction ID actually in circulation, plus headroom. Hardcoding a
+    ceiling silently misses the newest factions, which are the ones recruiting."""
+    top = 0
+    for q in ("SELECT MAX(id) m FROM faction",
+              "SELECT MAX(faction_id) m FROM war_side",
+              "SELECT MAX(faction_id) m FROM territory"):
+        try:
+            top = max(top, conn.execute(q).fetchone()["m"] or 0)
+        except sqlite3.Error:
+            pass
+    ceiling = int(top * 1.15) + 2000 if top else 60000
+    print("Highest live faction ID seen: %d. Sweeping to %d for headroom." % (top, ceiling))
+    return ceiling
+
+
 def cmd_sweep(conn, cfg, client):
     """Walk every faction ID in existence. This is the only way to get a truly
     complete list — the hall of fame is capped and ranked wars only show factions
     that enlist. Slow, but resumable: stop and restart it as often as you like."""
     sweep = cfg["discovery"].get("id_sweep", {})
-    start, end = sweep.get("start", 1), sweep.get("end", 60000)
+    start = sweep.get("start", 1)
+    end = sweep.get("end") or _detect_ceiling(conn)
     rate = cfg.get("requests_per_minute", 55)
     cursor = int(kv_get(conn, "sweep_cursor", start))
     remaining = max(0, end - cursor)
@@ -324,59 +358,151 @@ def cmd_sweep(conn, cfg, client):
 
 
 def cmd_wars(conn, cfg, client):
-    """Walk ranked war history backwards. Each response caps at 100 wars."""
-    days = cfg["discovery"].get("war_history_days", 240)
+    """Build real ranked war history.
+
+    torn/rankedwars only returns the *current* war pool — matchmaking runs once a
+    week, so every faction in it shows exactly one war. That endpoint is for
+    discovering war IDs, not history. Actual results live in torn/rankedwarreport,
+    one call per war ID, which is public. War IDs are sequential, so we walk them.
+
+    Resumable and incremental: the first run backfills, later runs only fetch wars
+    that appeared since.
+    """
+    days = cfg["discovery"].get("war_history_days", 400)
     now = int(time.time())
-    floor_ts = now - days * 86400
-    to_ts = now
-    print("Ranked wars: last %d days" % days)
-    total = 0
+    cutoff = now - days * DAY
 
-    for _ in range(400):  # hard stop
-        data, err = client.call("torn/", version=1, selections="rankedwars",
-                                **{"from": floor_ts, "to": to_ts})
-        if err:
-            print("  %s" % err.get("error"))
-            break
-        wars = (data or {}).get("rankedwars") or {}
-        if not wars:
-            break
-
-        oldest = to_ts
-        new_here = 0
-        for war_id, w in wars.items():
+    # Newest war IDs come from the live pool.
+    newest = 0
+    data, err = client.call("torn/", version=1, selections="rankedwars")
+    if not err:
+        for wid, w in ((data or {}).get("rankedwars") or {}).items():
             try:
-                war_id = int(war_id)
+                newest = max(newest, int(wid))
             except (TypeError, ValueError):
-                continue
-            info = w.get("war") or {}
-            start = int(info.get("start") or 0)
-            end = int(info.get("end") or 0)
-            winner = info.get("winner")
-            winner = int(winner) if winner else None
-            exists = conn.execute("SELECT 1 FROM war WHERE war_id=?", (war_id,)).fetchone()
-            if not exists:
-                new_here += 1
-            conn.execute("INSERT OR REPLACE INTO war VALUES (?,?,?,?,?)",
-                         (war_id, start, end, winner, info.get("target")))
-            for fid, f in (w.get("factions") or {}).items():
-                fid = int(fid)
-                conn.execute("INSERT OR REPLACE INTO war_side VALUES (?,?,?,?,?)",
-                             (war_id, fid, f.get("name"), f.get("score") or 0, f.get("chain") or 0))
-                note_faction(conn, fid, f.get("name"), None, "rankedwar")
-            if start:
-                oldest = min(oldest, start)
+                pass
+            _store_war(conn, wid, w.get("war") or {}, w.get("factions") or {})
         conn.commit()
-        total += new_here
-        print("  %d wars in window ending %s (+%d new)" %
-              (len(wars), time.strftime("%Y-%m-%d", time.gmtime(to_ts)), new_here))
+    row = conn.execute("SELECT MAX(war_id) m, MIN(war_id) n FROM war").fetchone()
+    have_max, have_min = row["m"] or 0, row["n"] or 0
+    newest = max(newest, have_max)
 
-        if len(wars) < 100 or oldest <= floor_ts or oldest >= to_ts:
+    if not newest:
+        print("  could not find any war IDs to start from — is the key working?")
+        return
+
+    print("Ranked wars: walking reports back %d days from war #%d" % (days, newest))
+    fetched = misses = 0
+    t0 = time.time()
+    oldest_seen = None
+
+    # Forward pass first (cheap, catches anything new), then backward backfill.
+    ranges = []
+    if have_max and newest > have_max:
+        ranges.append(range(have_max + 1, newest + 1))
+    ranges.append(range(have_min - 1 if have_min else newest, 0, -1))
+
+    stop = False
+    for rng in ranges:
+        if stop:
             break
-        to_ts = oldest - 1
+        consecutive_misses = 0
+        for wid in rng:
+            if wid <= 0:
+                break
+            if conn.execute("SELECT 1 FROM war WHERE war_id=?", (wid,)).fetchone():
+                continue
+            d, e = client.call("torn/%d" % wid, version=1, selections="rankedwarreport")
+            report = (d or {}).get("rankedwarreport") if isinstance(d, dict) else None
+            if e or not report:
+                misses += 1
+                consecutive_misses += 1
+                # Gaps in the ID space are normal; a long run of them means we've
+                # walked off the end of the sequence.
+                if consecutive_misses >= 40:
+                    break
+                continue
+            consecutive_misses = 0
+            war = report.get("war") or {}
+            _store_war(conn, wid, war, report.get("factions") or {})
+            fetched += 1
+            ts = int(war.get("end") or war.get("start") or 0)
+            if ts:
+                oldest_seen = ts if oldest_seen is None else min(oldest_seen, ts)
+            if fetched % 50 == 0:
+                conn.commit()
+                age = "" if not oldest_seen else "  back to %s" % time.strftime(
+                    "%Y-%m-%d", time.gmtime(oldest_seen))
+                print("  %d wars fetched, %d gaps, %s elapsed%s"
+                      % (fetched, misses, _dur(time.time() - t0), age))
+            if ts and ts < cutoff:
+                print("  reached the %d day cutoff" % days)
+                stop = True
+                break
+        conn.commit()
 
+    conn.commit()
     n = conn.execute("SELECT COUNT(*) c FROM war").fetchone()["c"]
-    print("  war records stored: %d" % n)
+    sides = conn.execute("SELECT COUNT(DISTINCT faction_id) c FROM war_side").fetchone()["c"]
+    print("  %d wars on record across %d factions (+%d this run)" % (n, sides, fetched))
+
+
+def _store_war(conn, war_id, war, factions):
+    try:
+        war_id = int(war_id)
+    except (TypeError, ValueError):
+        return
+    winner = war.get("winner")
+    try:
+        winner = int(winner) if winner else None
+    except (TypeError, ValueError):
+        winner = None
+    conn.execute("INSERT OR REPLACE INTO war VALUES (?,?,?,?,?)", (
+        war_id, int(war.get("start") or 0), int(war.get("end") or 0),
+        winner, war.get("target")))
+
+    if isinstance(factions, list):
+        factions = {f.get("id"): f for f in factions if isinstance(f, dict) and f.get("id")}
+    for fid, f in (factions or {}).items():
+        if not isinstance(f, dict):
+            continue
+        try:
+            fid = int(fid)
+        except (TypeError, ValueError):
+            continue
+        conn.execute("INSERT OR REPLACE INTO war_side VALUES (?,?,?,?,?)",
+                     (war_id, fid, f.get("name"),
+                      int(f.get("score") or 0), int(f.get("chain") or 0)))
+        note_faction(conn, fid, f.get("name"), None, "rankedwar")
+
+
+def cmd_territory(conn, cfg, client):
+    """One call returns every territory in the game and who holds it. Territories
+    pay daily respect, so this is a cheap read on how organised a faction is."""
+    data, err = client.call("torn/", version=1, selections="territory")
+    terr = (data or {}).get("territory") if isinstance(data, dict) else None
+    if err or not terr:
+        print("Territory: unavailable (%s)" % (err.get("error") if err else "empty response"))
+        return
+    conn.execute("DELETE FROM territory")
+    n = 0
+    for name, t in terr.items():
+        if not isinstance(t, dict):
+            continue
+        fid = t.get("faction") or 0
+        try:
+            fid = int(fid)
+        except (TypeError, ValueError):
+            continue
+        if not fid:
+            continue
+        conn.execute("INSERT OR REPLACE INTO territory VALUES (?,?,?,?)",
+                     (name, fid, int(t.get("size") or 0), int(t.get("daily_respect") or 0)))
+        note_faction(conn, fid, source="territory")
+        n += 1
+    conn.commit()
+    holders = conn.execute("SELECT COUNT(DISTINCT faction_id) c FROM territory").fetchone()["c"]
+    print("Territory: %d held across %d factions" % (n, holders))
 
 
 # --------------------------------------------------------------------------
@@ -384,35 +510,86 @@ def cmd_wars(conn, cfg, client):
 # --------------------------------------------------------------------------
 
 def cmd_enrich(conn, cfg, client):
-    max_age = cfg["enrich"].get("refresh_after_hours", 20) * 3600
+    """Re-reads factions, but not all of them equally often. A faction nobody has
+    touched in a year does not need a weekly roster pull; one that warred on
+    Tuesday does. Without this, a full directory makes every run take hours."""
+    hours = cfg["enrich"].get("refresh_after_hours", 20)
     limit = cfg["enrich"].get("max_per_run", 100000)
-    cutoff = int(time.time()) - max_age
-    rows = conn.execute(
-        "SELECT id FROM faction WHERE dead=0 AND (last_enriched IS NULL OR last_enriched < ?) "
-        "ORDER BY last_enriched IS NOT NULL, id LIMIT ?", (cutoff, limit)).fetchall()
-    print("Enriching %d factions (~%.1f min at current rate)" %
-          (len(rows), len(rows) * client.limiter.interval / 60))
+    now = int(time.time())
+    tiers = cfg["enrich"].get("refresh_days_by_tier", {"live": 0, "quiet": 7, "dormant": 30})
+    rows = conn.execute("""
+        SELECT f.id,
+               COALESCE(f.tier, 'live') AS tier,
+               COALESCE(f.last_enriched, 0) AS le
+        FROM faction f WHERE f.dead = 0
+    """).fetchall()
+    due = []
+    for r in rows:
+        wait = tiers.get(r["tier"], 0) * DAY + hours * 3600
+        if now - r["le"] >= wait:
+            due.append(r["id"])
+    due = due[:limit]
+    counts = {}
+    for r in rows:
+        counts[r["tier"]] = counts.get(r["tier"], 0) + 1
+    if counts:
+        print("Tiers: " + ", ".join("%s %d" % kv for kv in sorted(counts.items())))
+    rows = [{"id": i} for i in due]
+    print("Enriching %d factions (~%s at current rate)" %
+          (len(rows), _dur(len(rows) * client.limiter.interval)))
 
-    ok = gone = 0
+    ok = gone = failed = 0
     t0 = time.time()
     for i, r in enumerate(rows, 1):
         fid = r["id"]
         data, err = client.call("faction/%d" % fid, version=1, selections="basic")
         if err or not isinstance(data, dict) or not data.get("name"):
             # v2 fallback: basic and members are separate endpoints there
-            data = _v2_basic(client, fid)
+            definitely_gone = bool(err) and err.get("code") == TornClient.ERR_NO_SUCH_ID
+            data = None if definitely_gone else _v2_basic(client, fid)
             if not data:
-                conn.execute("UPDATE faction SET dead=1, last_enriched=? WHERE id=?",
-                             (int(time.time()), fid))
-                gone += 1
+                if definitely_gone:
+                    # Only retire a faction when Torn says the ID doesn't exist.
+                    # A timeout or a 500 must not delete a live faction.
+                    conn.execute("UPDATE faction SET dead=1, last_enriched=? WHERE id=?",
+                                 (int(time.time()), fid))
+                    gone += 1
+                else:
+                    failed += 1
                 continue
         _store_basic(conn, fid, data)
+        _classify(conn, fid, cfg)
         ok += 1
         if i % 25 == 0:
             conn.commit()
-            print("  %s  %d ok, %d gone" % (_progress(i, len(rows), t0), ok, gone))
+            print("  %s  %d ok, %d retired, %d failed" %
+                  (_progress(i, len(rows), t0), ok, gone, failed))
     conn.commit()
-    print("  updated %d, marked gone %d" % (ok, gone))
+    print("  updated %d, retired %d, temporarily failed %d" % (ok, gone, failed))
+    if failed:
+        print("  (failures are retried next run — nothing was discarded)")
+
+
+def _classify(conn, fid, cfg):
+    """Tier a faction by the most recent thing anyone in it did. This is the only
+    activity signal available on first contact — respect growth and member churn
+    both need two crawls, and waiting a week to find out a faction is dead is no
+    use when you are building a directory."""
+    row = conn.execute("""
+        SELECT MAX(last_action_ts) la, COUNT(*) n FROM member
+        WHERE faction_id=? AND ts=(SELECT MAX(ts) FROM member WHERE faction_id=?)
+    """, (fid, fid)).fetchone()
+    last = row["la"] or 0
+    war = conn.execute("SELECT MAX(w.end_ts) e FROM war_side s JOIN war w USING(war_id) "
+                       "WHERE s.faction_id=?", (fid,)).fetchone()["e"] or 0
+    last = max(last, war)
+    age = (int(time.time()) - last) / DAY if last else 99999
+    live = cfg["enrich"].get("live_within_days", 7)
+    quiet = cfg["enrich"].get("quiet_within_days", 90)
+    dead = cfg["enrich"].get("dead_after_days", 365)
+    tier = "live" if age <= live else "quiet" if age <= quiet else \
+           "dormant" if age <= dead else "abandoned"
+    conn.execute("UPDATE faction SET tier=?, last_activity=? WHERE id=?", (tier, last, fid))
 
 
 def _v2_basic(client, fid):
@@ -445,9 +622,12 @@ def _store_basic(conn, fid, d):
     if member_count is None:
         member_count = len(members) if members else 0
 
+    # v1 exposes currently-scheduled ranked wars; v2 has an explicit flag. The old
+    # fallback also counted hall-of-fame position, which nearly every faction has,
+    # so almost everything read as enlisted.
     enlisted = d.get("is_enlisted")
     if enlisted is None:
-        enlisted = 1 if (d.get("ranked_wars") or rank.get("position")) else 0
+        enlisted = 1 if d.get("ranked_wars") else 0
 
     conn.execute("INSERT OR REPLACE INTO snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
         fid, ts,
@@ -558,13 +738,79 @@ def cmd_stats(conn, cfg, client):
 DAY = 86400
 
 
+def cmd_factiontree(conn, cfg, client):
+    """Pull Torn's own upgrade tree so the chain-cost table isn't my guesswork.
+    Cached in the database; a few hundred bytes and it rarely changes."""
+    data, err = client.call("torn/", version=1, selections="factiontree")
+    tree = (data or {}).get("factiontree") if isinstance(data, dict) else None
+    if err or not tree:
+        print("Faction tree: unavailable (%s). Falling back to the built-in table."
+              % (err.get("error") if err else "empty"))
+        return
+    kv_set(conn, "factiontree", json.dumps(tree))
+    branches = len(tree) if isinstance(tree, (dict, list)) else 0
+    print("Faction tree: cached %d branches — chain costs now come from Torn." % branches)
+
+
+def _chain_costs(conn):
+    """Cumulative respect to unlock each chain tier. Prefers Torn's live tree."""
+    raw = kv_get(conn, "factiontree")
+    if raw:
+        try:
+            tree = json.loads(raw)
+            found = []
+            def walk(node):
+                if isinstance(node, dict):
+                    name = str(node.get("name", ""))
+                    ability = str(node.get("ability", ""))
+                    blob = (name + " " + ability).lower()
+                    if "chain" in blob:
+                        import re as _re
+                        nums = _re.findall(r"(\d[\d,]*)", blob)
+                        cost = node.get("challenge") or node.get("base_price") or node.get("price")
+                        if nums and cost:
+                            found.append((int(nums[-1].replace(",", "")), int(cost)))
+                    for v in node.values():
+                        walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk(v)
+            walk(tree)
+            if len(found) >= 5:
+                found.sort()
+                total, out = 0, []
+                for size, cost in found:
+                    total += cost
+                    out.append((size, total))
+                return out, "torn/factiontree"
+        except (ValueError, TypeError, KeyError):
+            pass
+    return CHAIN_TIERS, "built-in table (Torn's tree was unavailable)"
+
+
 def cmd_score(conn, cfg, _client=None):
     now = int(time.time())
     me = cfg.get("me", {})
 
+    dead_after = cfg.get("enrich", {}).get("dead_after_days", 365)
     factions = {}
+    excluded = 0
     for r in conn.execute("SELECT * FROM faction WHERE dead=0").fetchall():
-        factions[r["id"]] = {"id": r["id"], "name": r["name"], "tag": r["tag"]}
+        tier = r["tier"] or "live"
+        if tier == "abandoned":
+            excluded += 1
+            continue
+        factions[r["id"]] = {"id": r["id"], "name": r["name"], "tag": r["tag"],
+                             "tier": tier, "last_activity": r["last_activity"] or 0}
+
+    territory = {}
+    for r in conn.execute("SELECT faction_id, COUNT(*) n, SUM(daily_respect) dr "
+                          "FROM territory GROUP BY faction_id").fetchall():
+        territory[r["faction_id"]] = (r["n"], r["dr"] or 0)
+
+    stats_pool = {r["faction_id"] for r in conn.execute(
+        "SELECT DISTINCT faction_id FROM member m WHERE EXISTS "
+        "(SELECT 1 FROM player_stat p WHERE p.player_id = m.player_id)").fetchall()}
 
     # latest + historical snapshots
     snaps = defaultdict(list)
@@ -601,6 +847,8 @@ def cmd_score(conn, cfg, _client=None):
 
     stats = {r["player_id"]: dict(r) for r in
              conn.execute("SELECT * FROM player_stat").fetchall()}
+
+    chain_costs, chain_source = _chain_costs(conn)
 
     out = []
     for fid, base in factions.items():
@@ -698,15 +946,63 @@ def cmd_score(conn, cfg, _client=None):
                     rec[k] = None
 
         # --- development proxy: perks aren't public, so infer investment ---
-        rec["respect_invested_min"] = _infer_investment(cur["best_chain"], cur["capacity"])
+        rec["respect_invested_min"] = _infer_investment(
+            cur["best_chain"], cur["capacity"], chain_costs)
         rec["chain_tier"] = _chain_tier(cur["best_chain"])
 
+        t = territory.get(fid)
+        rec["territories"] = t[0] if t else 0
+        rec["territory_respect_daily"] = t[1] if t else 0
+        rec["days_since_activity"] = round((now - base["last_activity"]) / DAY) \
+            if base["last_activity"] else None
+
+        # Say plainly whether a blank means "no data exists" or "we didn't look".
+        rec["stats_looked_up"] = fid in stats_pool
+        rec["playstyle"] = _playstyle(rec)
         rec["torn_url"] = "https://www.torn.com/factions.php?step=profile&ID=%d" % fid
         out.append(rec)
 
     out.sort(key=lambda r: (r.get("winrate_90d") or 0, r.get("respect") or 0), reverse=True)
 
+    is_demo = bool(conn.execute(
+        "SELECT 1 FROM faction WHERE source='demo' LIMIT 1").fetchone())
+
     payload = {
+        "demo": is_demo,
+        "notes": {
+            "respect_invested_min": (
+                "A floor, not a real figure. Faction perks are private to their own "
+                "members, so this is inferred from chain tier and member capacity, "
+                "both of which are public and unlock in a fixed order at known "
+                "respect costs. Chain costs come from %s. Capacity costs rise as a "
+                "faction grows and this assumes a flat average per upgrade, so the "
+                "real figure is higher than what you see here." % chain_source),
+            "stats": (
+                "Battle stats are private in Torn. These are public estimates from "
+                "FFScouter, inferred from fair-fight values reported by attackers. "
+                "They get unreliable above about 25b and are only as fresh as the "
+                "last time someone attacked that player."),
+            "stats_coverage": (
+                "Estimates are only looked up for the top %d factions by respect, to "
+                "keep collection within the API rate limit. A blank stat column on a "
+                "smaller faction means it was not checked, not that the faction is "
+                "weak." % cfg.get("enrich", {}).get("stats_faction_limit", 1500)),
+            "growth": (
+                "Respect growth is measured by comparing two readings taken apart in "
+                "time. It is blank until this has run at least twice, and the window "
+                "actually used is shown as growth_window_days."),
+            "winrate": (
+                "Records under five wars are pulled toward 50%%. A 2-0 faction is not "
+                "a 100%% faction. Raw records are always shown alongside."),
+            "activity": (
+                "Factions where nobody has done anything in %d days are collected but "
+                "left out of these rankings." % dead_after),
+            "recruit": (
+                "For your first 72 hours in any faction you are a Recruit: no faction "
+                "perks, no chain contribution, no organised crimes, and no score in a "
+                "ranked war. Joining the night before a war does not get you into it."),
+        },
+        "excluded_inactive": excluded,
         "generated": now,
         "generated_human": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now)),
         "faction_count": len(out),
@@ -716,15 +1012,17 @@ def cmd_score(conn, cfg, _client=None):
             "with_war_record": sum(1 for r in out if r.get("wars_total")),
             "with_stat_estimates": sum(1 for r in out if r.get("stats_median")),
             "with_growth": sum(1 for r in out if r.get("respect_gain_30d") is not None),
+            "with_territory": sum(1 for r in out if r.get("territories")),
+            "by_tier": {t: sum(1 for r in out if r.get("tier") == t)
+                        for t in ("live", "quiet", "dormant")},
         },
         "factions": out,
     }
     out_dir = OPTS.get("out") or HERE
     os.makedirs(out_dir, exist_ok=True)
     if OPTS.get("slim"):
-        drop = ("stats_total", "stats_max", "avg_war_score_90d", "wars_180d", "wins_180d",
-                "winrate_180d", "wars_60d", "wins_60d", "winrate_60d", "level_min",
-                "level_max", "pct_hospital", "rank_level", "chain_tier", "torn_url")
+        drop = ("stats_total", "avg_war_score_90d", "wars_60d", "wins_60d",
+                "winrate_60d", "rank_level", "chain_tier", "torn_url")
         for r in out:
             for k in drop:
                 r.pop(k, None)
@@ -745,7 +1043,38 @@ def cmd_score(conn, cfg, _client=None):
 
     print("Wrote factions.json and factions.csv (%d factions)" % len(out))
     print("Coverage: %s" % json.dumps(payload["coverage"]))
+    if excluded:
+        print("Left out %d factions with no activity in %d days." % (excluded, dead_after))
     print("Open dashboard.html to explore.")
+
+
+def _playstyle(r):
+    """A plain-language label for what a faction actually does. Half the player
+    base is not looking for a war machine, and a leaderboard that only measures
+    warring quietly tells them all the wrong factions are good."""
+    tags = []
+    wpm = r.get("wars_per_month") or 0
+    chain = r.get("best_chain") or 0
+    terr = r.get("territories") or 0
+    growth = r.get("respect_gain_per_day") or 0
+    active = r.get("pct_active_7d")
+    size = r.get("roster_size") or 0
+
+    if wpm >= 1.0:
+        tags.append("warring")
+    elif wpm >= 0.3:
+        tags.append("occasional war")
+    if chain >= 10000:
+        tags.append("chaining")
+    if terr >= 3:
+        tags.append("territory")
+    if growth > 0 and wpm < 0.3 and chain < 10000:
+        tags.append("crime & cash")
+    if active is not None and active >= 0.8 and size >= 20:
+        tags.append("very active")
+    if not tags:
+        tags.append("quiet")
+    return tags
 
 
 def _snapshot_near(snaps, target_ts):
@@ -766,7 +1095,7 @@ CHAIN_TIERS = [
     (500, 15_000), (1000, 40_000), (2500, 110_000), (5000, 300_000),
     (10000, 800_000), (25000, 2_200_000), (50000, 6_000_000), (100000, 17_000_000),
 ]
-CAPACITY_STEP_COST = 1_500  # rough average per +5 slots; scales up in reality
+CAPACITY_STEP_COST = 1_500  # fallback only; the real curve comes from torn/factiontree
 
 
 def _chain_tier(best_chain):
@@ -777,9 +1106,9 @@ def _chain_tier(best_chain):
     return tier
 
 
-def _infer_investment(best_chain, capacity):
+def _infer_investment(best_chain, capacity, tiers=None):
     total = 0
-    for size, cost in CHAIN_TIERS:
+    for size, cost in (tiers or CHAIN_TIERS):
         if (best_chain or 0) >= size:
             total = cost
     steps = max(0, ((capacity or 0) - 10) // 5)
@@ -801,7 +1130,8 @@ def cmd_demo(conn, _cfg=None, _client=None):
                "Division", "Chapter", "Front", "League", "Circle", "Works", "Assembly"]
 
     conn.executescript("DELETE FROM faction; DELETE FROM snapshot; DELETE FROM member;"
-                       "DELETE FROM war; DELETE FROM war_side; DELETE FROM player_stat;")
+                       "DELETE FROM war; DELETE FROM war_side; DELETE FROM player_stat;"
+                       "DELETE FROM territory;")
 
     tier_profiles = [(0.05, 3.0), (0.20, 1.2), (0.45, 0.35), (1.0, 0.08)]
     pid = 100000
@@ -812,7 +1142,8 @@ def cmd_demo(conn, _cfg=None, _client=None):
         name = "%s %s" % (random.choice(words_a), random.choice(words_b))
         roll = random.random()
         strength = next(m for c, m in tier_profiles if roll <= c)
-        conn.execute("INSERT INTO faction VALUES (?,?,?,?,?,?,0)",
+        conn.execute("INSERT INTO faction (id,name,tag,first_seen,source,last_enriched,dead)"
+                     " VALUES (?,?,?,?,?,?,0)",
                      (fid, name, name[:3].upper(), now, "demo", now))
 
         cap = random.choice([25, 50, 75, 100, 100, 100])
@@ -854,6 +1185,14 @@ def cmd_demo(conn, _cfg=None, _client=None):
                          (war_id, fid, name, my_score, chain))
             conn.execute("INSERT INTO war_side VALUES (?,?,?,?,?)",
                          (war_id, -1, "Opponent", opp, chain))
+        if random.random() < 0.25:
+            for t in range(random.randint(1, 6)):
+                conn.execute("INSERT OR REPLACE INTO territory VALUES (?,?,?,?)",
+                             ("%s-%d" % (name[:2].upper(), t), fid,
+                              random.randint(100, 900), random.randint(10, 90)))
+    conn.commit()
+    for r in conn.execute("SELECT id FROM faction").fetchall():
+        _classify(conn, r["id"], DEFAULT_CONFIG)
     conn.commit()
     print("Seeded 140 demo factions. Now run: python3 scout.py score")
 
@@ -900,7 +1239,9 @@ def cmd_history_save(conn, *_):
     means the database itself can be thrown away and rebuilt anywhere."""
     series = defaultdict(list)
     for r in conn.execute(
-            "SELECT faction_id, ts, respect, member_count, capacity FROM snapshot ORDER BY ts"):
+            "SELECT s.faction_id, s.ts, s.respect, s.member_count, s.capacity "
+            "FROM snapshot s JOIN faction f ON f.id = s.faction_id "
+            "WHERE f.dead = 0 ORDER BY s.ts"):
         series[str(r["faction_id"])].append(
             [r["ts"], r["respect"], r["member_count"], r["capacity"]])
 
@@ -1072,7 +1413,9 @@ def cmd_doctor(conn, cfg, client):
 
 def cmd_run(conn, cfg, client):
     cmd_history_load(conn)
+    cmd_factiontree(conn, cfg, client)
     cmd_discover(conn, cfg, client)
+    cmd_territory(conn, cfg, client)
     cmd_enrich(conn, cfg, client)
     cmd_stats(conn, cfg, client)
     cmd_prune(conn)
@@ -1081,6 +1424,7 @@ def cmd_run(conn, cfg, client):
 
 
 def main():
+    global CFG
     # CI captures stdout through a pipe, which makes Python block-buffer it and
     # makes a working job look frozen. Force line buffering.
     try:
@@ -1092,7 +1436,7 @@ def main():
     p.add_argument("command", choices=["init", "demo", "discover", "wars", "enrich",
                                        "stats", "score", "run", "snapshot", "status",
                                        "prune", "history-save", "history-load", "doctor",
-                                       "sweep"])
+                                       "sweep", "territory", "factiontree"])
     p.add_argument("--out", metavar="DIR",
                    help="where to write factions.json and factions.csv")
     p.add_argument("--slim", action="store_true",
@@ -1106,8 +1450,9 @@ def main():
 
     conn = open_db()
     needs_key = args.command in ("discover", "wars", "enrich", "stats", "run",
-                                "snapshot", "doctor", "sweep")
+                                "snapshot", "doctor", "sweep", "territory", "factiontree")
     cfg = load_config() if os.path.exists(CONFIG_PATH) else DEFAULT_CONFIG
+    CFG.update(cfg)
     client = None
     if needs_key:
         key = (cfg.get("torn_api_key") or os.environ.get("TORN_API_KEY") or "").strip()
@@ -1120,7 +1465,8 @@ def main():
           "run": cmd_run, "snapshot": cmd_snapshot, "status": cmd_status,
           "prune": cmd_prune, "history-save": cmd_history_save,
           "history-load": cmd_history_load, "doctor": cmd_doctor,
-          "sweep": cmd_sweep}[args.command]
+          "sweep": cmd_sweep, "territory": cmd_territory,
+          "factiontree": cmd_factiontree}[args.command]
 
     start = time.time()
     fn(conn, cfg, client)

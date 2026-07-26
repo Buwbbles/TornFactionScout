@@ -85,11 +85,24 @@ workflow. There's nothing else to configure here.
 
 ## Step 5 — Run it
 
-**Actions** tab → **Refresh faction data and publish** → **Run workflow**.
+**Actions** tab → in the left sidebar pick **Refresh faction data and publish** → the
+**Run workflow** button on the right → **Run workflow** in the dropdown.
 
-The first run takes 40–70 minutes: it discovers a few thousand factions, then pulls each
-one's roster at 90 calls a minute. Watch the log if you like — it prints progress every
-25 factions.
+That's the only workflow in the repo; there's nothing else to choose.
+
+The first run takes **one to two hours**. It runs as separate steps so you can see where
+it is — GitHub shows a live timer next to each:
+
+| Step | Expect |
+|---|---|
+| Check the API is answering | seconds |
+| Find factions | 2–6 minutes |
+| Pull rosters | **30–60 minutes** |
+| Pull stat estimates | 10–40 minutes, or seconds if you skipped FFScouter |
+| Score, assemble, publish | 2–3 minutes |
+
+"Pull rosters" prints a line every 25 factions with an elapsed time and an ETA. If you see
+those ticking over, it's working — leave it alone.
 
 When both jobs go green, your site is at:
 
@@ -129,12 +142,15 @@ uses a twentieth of the quota.
 **Cover more factions.** In `config.json` defaults, raise `hof_pages` from 10 to 30, and
 `war_history_days` from 240 to 400. Costs more time, finds more of the mid-tier.
 
+**Finish sooner.** Stat estimates are the slowest step and only run for the top
+`stats_faction_limit` factions by respect (1,500 by default). Drop it to 500 and that step
+roughly triples in speed. Lower `hof_pages` to 5 and the roster pull shrinks too.
+
 **Cover every faction.** The full ID sweep (60,000 IDs, ~11 hours at 90/min) won't fit in
 a single Actions job. Run it locally instead:
 
 ```bash
-# edit config.json: discovery.id_sweep.enabled = true
-python3 scout.py discover        # resumable — Ctrl-C and rerun as often as you like
+python3 scout.py sweep           # resumable — Ctrl-C and rerun as often as you like
 python3 scout.py history-save
 ```
 
@@ -188,8 +204,29 @@ build that until people are actually asking for it.
 
 ## When something breaks
 
+**A step looks frozen** — check the timer next to the step name. If it's climbing, the job
+is running. "Pull rosters" legitimately takes 30–60 minutes and there is nothing to do but
+wait. Expand the step to see the progress lines and their ETAs.
+
+If a step shows *no output at all* for more than a few minutes, that's the old buffering
+bug: make sure `PYTHONUNBUFFERED: "1"` is still in the `env:` block near the top of
+`update.yml`. Python hides its own output when CI captures it through a pipe, and a healthy
+job then looks dead for an hour.
+
+**Is it broken or just slow?** Run the diagnostic locally — it takes ten seconds and needs
+nothing but your key in `config.json`:
+
+```bash
+python3 scout.py doctor
+```
+
+It calls every endpoint the crawler depends on and prints ok or FAIL for each, plus a time
+estimate for the enrichment step. If every line says ok, the workflow isn't broken, it's
+just long.
+
 **Workflow fails immediately** — the secret name is misspelled, or Actions is disabled
-under Settings → Actions → General.
+under Settings → Actions → General. The Configure step now fails loudly with a named error
+if `TORN_API_KEY` is empty, so check there first.
 
 **Site 404s** — Pages source isn't set to "GitHub Actions", or the `publish` job hasn't
 finished yet. Give it a minute.
