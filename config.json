@@ -1,0 +1,28 @@
+{
+  "torn_api_key": "",
+  "_comment_key": "A Public-access key is enough. Never paste a Limited/Full key into a tool you didn't write.",
+  "ffscouter_key": "",
+  "_comment_ffscouter": "Optional. Your Torn key registered at ffscouter.com. Unlocks battle-stat estimates.",
+  "requests_per_minute": 55,
+  "_comment_rate": "Torn allows 100/min per USER across all your keys. 55 leaves headroom for playing.",
+  "me": {
+    "level": 0,
+    "battle_stats_total": 0,
+    "_comment": "Used for the personal Fit score. Fill in or leave at 0 to disable."
+  },
+  "discovery": {
+    "hof_pages": 10,
+    "_comment_hof": "Each page = 100 factions from the respect hall of fame.",
+    "war_history_days": 240,
+    "id_sweep": {
+      "enabled": false,
+      "start": 1,
+      "end": 60000,
+      "_comment": "Brute-force every faction ID. Thorough but slow: ~18 hours at 55/min."
+    }
+  },
+  "enrich": {
+    "refresh_after_hours": 20,
+    "max_per_run": 100000
+  }
+}
