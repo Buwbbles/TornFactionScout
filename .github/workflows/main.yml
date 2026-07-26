@@ -1,0 +1,107 @@
+name: Refresh faction data and publish
+
+# Runs on a schedule, crawls the Torn API with the operator's key, and pushes the
+# result to GitHub Pages. Visitors never supply a key of their own.
+#
+# The crawl is split into separate steps on purpose: GitHub shows a live timer
+# next to each one, so you can see which phase is running rather than staring at
+# a single opaque "Crawl and score" that takes an hour.
+
+on:
+  schedule:
+    # 04:10 UTC every Monday. Change the day/hour to taste; avoid the top of the
+    # hour, when GitHub's scheduler is busiest and jobs get delayed.
+    - cron: "10 4 * * 1"
+  workflow_dispatch:        # adds a "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write           # to commit history.json back to the repo
+  pages: write
+  id-token: write
+
+concurrency:
+  group: faction-scout
+  cancel-in-progress: false
+
+env:
+  # Without this, Python block-buffers stdout when CI captures it through a pipe
+  # and a perfectly healthy job looks frozen for an hour. Do not remove.
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330    # GitHub kills a job at 360; stop short of that
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure
+        env:
+          TORN_API_KEY: ${{ secrets.TORN_API_KEY }}
+          FFSCOUTER_KEY: ${{ secrets.FFSCOUTER_KEY }}
+        run: |
+          set -e
+          test -n "$TORN_API_KEY" || { echo "::error::TORN_API_KEY secret is empty or misnamed"; exit 1; }
+          python3 scout.py init || true
+          python3 - <<'PY'
+          import json, os
+          cfg = json.load(open("config.json"))
+          cfg["torn_api_key"] = os.environ["TORN_API_KEY"]
+          cfg["ffscouter_key"] = os.environ.get("FFSCOUTER_KEY", "")
+          cfg["requests_per_minute"] = 90   # nobody is playing on this key
+          json.dump(cfg, open("config.json", "w"), indent=2)
+          PY
+
+      - name: Check the API is answering
+        run: |
+          python3 scout.py history-load
+          python3 scout.py doctor
+
+      - name: Find factions
+        run: python3 scout.py discover
+
+      - name: Pull rosters
+        run: python3 scout.py enrich
+
+      - name: Pull stat estimates
+        run: python3 scout.py stats
+
+      - name: Score
+        run: |
+          set -e
+          python3 scout.py prune
+          python3 scout.py score --out site --slim
+          python3 scout.py history-save
+          python3 scout.py status
+
+      - name: Assemble the site
+        run: |
+          cp dashboard.html site/index.html
+          gzip -9 -c site/factions.json | wc -c | awk '{print "payload gzipped: " $1/1024 " KB"}'
+
+      - name: Save the growth history
+        run: |
+          rm -f config.json scout.db
+          git config user.name  "faction-scout"
+          git config user.email "actions@github.com"
+          git add history.json
+          git diff --staged --quiet || git commit -m "History through $(date -u +%Y-%m-%d)"
+          git push
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  publish:
+    needs: crawl
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
