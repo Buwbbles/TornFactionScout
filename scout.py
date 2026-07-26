@@ -209,8 +209,24 @@ def open_db():
     CREATE INDEX IF NOT EXISTS idx_side_f ON war_side(faction_id);
     CREATE INDEX IF NOT EXISTS idx_terr_f ON territory(faction_id);
     """)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn):
+    """CREATE TABLE IF NOT EXISTS silently skips new columns on an existing
+    database, so upgrading in place would crash on the first UPDATE. Add anything
+    missing by hand."""
+    wanted = {
+        "faction": [("tier", "TEXT"), ("last_activity", "INTEGER")],
+    }
+    for table, cols in wanted.items():
+        have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+        for name, decl in cols:
+            if name not in have:
+                conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, decl))
+                print("Database upgraded: added %s.%s" % (table, name))
 
 
 def kv_get(conn, k, default=None):
@@ -1469,7 +1485,26 @@ def main():
           "factiontree": cmd_factiontree}[args.command]
 
     start = time.time()
-    fn(conn, cfg, client)
+    try:
+        fn(conn, cfg, client)
+    except KeyboardInterrupt:
+        print("\nStopped. Progress is saved — rerun the same command to continue.")
+        conn.commit()
+        conn.close()
+        sys.exit(130)
+    except BrokenPipeError:
+        os._exit(0)   # output was piped into something that closed early
+    except Exception:
+        import traceback
+        conn.commit()   # never throw away work already done
+        print("\n" + "=" * 62)
+        print("The '%s' command failed. Everything up to this point was saved." % args.command)
+        print("=" * 62)
+        traceback.print_exc()
+        print("=" * 62)
+        print("Rerun just this step to continue: python3 scout.py %s" % args.command)
+        conn.close()
+        sys.exit(1)
     if client:
         print("(%d API calls, %.1f min)" % (client.calls, (time.time() - start) / 60))
     conn.close()

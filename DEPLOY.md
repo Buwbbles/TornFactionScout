@@ -96,7 +96,9 @@ it is — GitHub shows a live timer next to each:
 | Step | Expect |
 |---|---|
 | Check the API is answering | seconds |
+| Cache Torn's upgrade tree | seconds |
 | Find factions | 2–6 minutes |
+| Find factions | 2–6 minutes, plus the first war backfill |
 | Pull rosters | **30–60 minutes** |
 | Pull stat estimates | 10–40 minutes, or seconds if you skipped FFScouter |
 | Score, assemble, publish | 2–3 minutes |
@@ -223,6 +225,21 @@ python3 scout.py doctor
 It calls every endpoint the crawler depends on and prints ok or FAIL for each, plus a time
 estimate for the enrichment step. If every line says ok, the workflow isn't broken, it's
 just long.
+
+**"Process completed with exit code 1"** — the annotation doesn't say which step, so open
+the run and find the one with a red X. The most common causes, in order:
+
+1. **The push at the end.** If `Save the growth history` is red, go to **Settings → Actions
+   → General → Workflow permissions** and choose **Read and write permissions**. When that's
+   set to read-only at the repo level, the `permissions:` block in the workflow can't grant
+   write, and the commit fails after the whole crawl has finished. This step is now
+   `continue-on-error`, so the site publishes either way and you just lose growth tracking.
+2. **An upgraded database.** Older `scout.db` files are missing the `tier` column. The tool
+   now migrates them on open and prints what it added, but if you're running an old copy of
+   `scout.py` against a new database it will crash. Delete `scout.db` and rerun.
+3. **A crash in one command.** The tool now prints a banner naming the failing command, then
+   the traceback. Whatever ran before it was saved, so rerun that single step rather than
+   starting over.
 
 **Workflow fails immediately** — the secret name is misspelled, or Actions is disabled
 under Settings → Actions → General. The Configure step now fails loudly with a named error
