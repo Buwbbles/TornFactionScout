@@ -5,7 +5,10 @@ name: Refresh faction data and publish
 #
 # The crawl is split into separate steps on purpose: GitHub shows a live timer
 # next to each one, so you can see which phase is running rather than staring at
-# a single opaque "Crawl and score" that takes an hour.
+# a single opaque step that takes an hour.
+#
+# Steps that add nice-to-have data are marked continue-on-error. A hiccup in
+# territory or stat estimates should degrade the site, not stop it publishing.
 
 on:
   schedule:
@@ -33,9 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330    # GitHub kills a job at 360; stop short of that
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -61,16 +63,22 @@ jobs:
           python3 scout.py history-load
           python3 scout.py doctor
 
+      - name: Cache Torn's upgrade tree
+        continue-on-error: true
+        run: python3 scout.py factiontree
+
       - name: Find factions
-        run: |
-          python3 scout.py factiontree
-          python3 scout.py discover
-          python3 scout.py territory
+        run: python3 scout.py discover
+
+      - name: Read territory holdings
+        continue-on-error: true
+        run: python3 scout.py territory
 
       - name: Pull rosters
         run: python3 scout.py enrich
 
       - name: Pull stat estimates
+        continue-on-error: true
         run: python3 scout.py stats
 
       - name: Score
@@ -83,17 +91,33 @@ jobs:
 
       - name: Assemble the site
         run: |
+          set -e
           cp dashboard.html site/index.html
+          test -s site/factions.json || { echo "::error::factions.json is missing or empty"; exit 1; }
           gzip -9 -c site/factions.json | wc -c | awk '{print "payload gzipped: " $1/1024 " KB"}'
 
+      # Publishing matters more than the commit. If the token can't push, say so
+      # loudly and carry on rather than throwing away a completed crawl.
       - name: Save the growth history
+        continue-on-error: true
         run: |
           rm -f config.json scout.db
+          if [ ! -f history.json ]; then
+            echo "::warning::history.json was not produced — growth tracking will restart"
+            exit 0
+          fi
           git config user.name  "faction-scout"
           git config user.email "actions@github.com"
           git add history.json
-          git diff --staged --quiet || git commit -m "History through $(date -u +%Y-%m-%d)"
-          git push
+          if git diff --staged --quiet; then
+            echo "No history changes to commit."
+            exit 0
+          fi
+          git commit -m "History through $(date -u +%Y-%m-%d)"
+          git push || {
+            echo "::warning::Could not push history.json. Check Settings -> Actions -> General -> Workflow permissions is set to 'Read and write permissions'. The site still published; only growth tracking is affected."
+            exit 0
+          }
 
       - uses: actions/upload-pages-artifact@v3
         with:
